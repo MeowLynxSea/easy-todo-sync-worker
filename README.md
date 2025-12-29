@@ -10,11 +10,24 @@
 
 1. 点击上面的 **Deploy to Cloudflare** 按钮
 2. 按向导提示创建并绑定 **D1 数据库**（一般直接下一步即可）
-3. 在向导里配置 secrets（至少需要）：
+3. 部署完成后，进入 **设置-变量和机密** 添加以下变量，类型选择 **密钥**：
    - `JWT_SECRET`
    - `TOKEN_PEPPER`
    - `OAUTH_PROVIDERS_JSON`
-4. 点击部署完成
+
+其中，`OAUTH_PROVIDERS_JSON`变量的值的一个例子为：
+
+```
+[{"name":"github","authorizeUrl":"https://github.com/login/oauth/authorize","tokenUrl":"https://github.com/login/oauth/access_token","userinfoUrl":"https://api.github.com/user","clientId":"YOUR_CLIENT_ID","clientSecret":"YOUR_CLIENT_SECRET","scope":"","idField":"id","accessTokenField":"access_token","extraAuthorizeParams":{},"extraTokenParams":{}}]
+```
+
+在申请OAuth时，请将回调地址填写为：**您的项目部署地址（一般是https://easy-todo-sync-worker.您的Cloudflare用户名.workers.dev）** + /v1/auth/callback
+
+如：`https://easy-todo-sync-worker.somebody.workers.dev/v1/auth/callback`
+
+注：您需要使用自己的部署地址，上面这个地址是不存在的，只为了说明您填入的回调地址应该长什么样。
+
+注：您可以配置多个 OAuth Privider，但是需要相应的修改各个参数。对于自用来说，我们推荐使用 Github。
 
 ## 自部署（Wrangler CLI）
 
