@@ -1,0 +1,53 @@
+name = "easy-todo-sync-worker"
+main = "src/index.ts"
+compatibility_date = "2025-12-29"
+
+# Create a D1 database and fill in `database_id`.
+[[d1_databases]]
+binding = "DB"
+database_name = "easy_todo_sync"
+database_id = "REPLACE_WITH_YOUR_D1_DATABASE_ID"
+migrations_dir = "migrations"
+
+[vars]
+# Optional; recommended in production.
+# BASE_URL = "https://<your-domain-or-workers-dev>"
+
+# Allowed app redirects (comma-separated).
+APP_REDIRECT_ALLOWLIST = "easy_todo://auth,https://easy-todo.0v0.live"
+
+# JWT issuer (optional)
+JWT_ISSUER = "easy_todo_sync_server"
+
+# Optional allowlist of enabled providers (comma-separated; default = all configured).
+# AUTH_PROVIDERS = "github,linuxdo"
+
+# CORS
+# CORS_ALLOW_ORIGINS = "*"
+# CORS_ALLOW_CREDENTIALS = "false"
+
+# Optional TTLs (seconds).
+# ACCESS_TOKEN_TTL_SECS = "900"
+# REFRESH_TOKEN_TTL_SECS = "2592000"
+# LOGIN_ATTEMPT_TTL_SECS = "600"
+# TICKET_TTL_SECS = "120"
+
+# Sync limits
+# MAX_PUSH_RECORDS = "500"
+
+# Secrets (set via `wrangler secret put`, do NOT place in [vars]):
+# - JWT_SECRET
+# - TOKEN_PEPPER
+# - OAUTH_PROVIDERS_JSON
+
+[observability]
+[observability.logs]
+enabled = true
+head_sampling_rate = 1
+invocation_logs = true
+persist = true
+
+[observability.traces]
+enabled = true
+head_sampling_rate = 1
+persist = true

@@ -1,0 +1,15 @@
+{
+  "name": "easy-todo-sync-worker",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler d1 migrations apply DB && wrangler deploy",
+    "d1:bootstrap": "node scripts/d1-bootstrap.mjs",
+    "d1:migrate:local": "wrangler d1 migrations apply DB --local",
+    "d1:migrate": "wrangler d1 migrations apply DB"
+  },
+  "devDependencies": {
+    "wrangler": "^4.0.0"
+  }
+}
