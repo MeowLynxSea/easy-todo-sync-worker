@@ -1,4 +1,4 @@
-import { execFileSync } from "node:child_process";
+import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 
@@ -11,28 +11,31 @@ function fail(message) {
 }
 
 function runWrangler(args) {
-  try {
-    return execFileSync("npx", ["wrangler", ...args], {
-      cwd,
-      stdio: ["inherit", "pipe", "pipe"],
-      encoding: "utf8",
-    });
-  } catch (error) {
-    const stdout = error?.stdout?.toString?.() ?? "";
-    const stderr = error?.stderr?.toString?.() ?? "";
+  const res = spawnSync("npx", ["wrangler", ...args], {
+    cwd,
+    stdio: ["inherit", "pipe", "pipe"],
+    encoding: "utf8",
+  });
+
+  const stdout = res.stdout?.toString?.() ?? "";
+  const stderr = res.stderr?.toString?.() ?? "";
+
+  if (res.status !== 0) {
     if (stdout) process.stdout.write(stdout);
     if (stderr) process.stderr.write(stderr);
-    throw error;
+    fail(`wrangler failed (${res.status}): npx wrangler ${args.join(" ")}`);
   }
+
+  return { stdout, stderr, output: `${stdout}${stderr}` };
 }
 
-function extractFirstDatabaseIdFromWranglerJson(jsonText) {
-  const data = JSON.parse(jsonText);
-  if (typeof data === "object" && data && "database_id" in data) return data.database_id;
-  if (Array.isArray(data)) {
-    const first = data.find((x) => x && typeof x === "object" && "database_id" in x);
-    if (first) return first.database_id;
-  }
+function extractDatabaseIdFromWranglerCreateOutput(text) {
+  const tomlStyle = text.match(/\bdatabase_id\s*=\s*"(.*?)"/i);
+  if (tomlStyle?.[1]) return tomlStyle[1].trim();
+
+  const uuid = text.match(/\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/i);
+  if (uuid?.[0]) return uuid[0];
+
   return null;
 }
 
@@ -66,9 +69,12 @@ if (existingId && existingId !== "REPLACE_WITH_YOUR_D1_DATABASE_ID") {
   console.log(`wrangler.toml already has database_id set for ${binding}: ${existingId}`);
 } else {
   console.log(`Creating D1 database: ${databaseName}`);
-  const out = runWrangler(["d1", "create", databaseName, "--json"]);
-  const createdId = extractFirstDatabaseIdFromWranglerJson(out);
-  if (!createdId) fail("Failed to parse database_id from `wrangler d1 create --json` output");
+  const res = runWrangler(["d1", "create", databaseName]);
+  const createdId = extractDatabaseIdFromWranglerCreateOutput(res.output);
+  if (!createdId) {
+    if (res.output) process.stdout.write(res.output);
+    fail("Failed to parse database_id from `wrangler d1 create` output");
+  }
 
   const updated = updateDatabaseIdInToml(tomlText, { binding, newDatabaseId: createdId });
   if (!updated) fail(`Failed to update database_id for binding "${binding}" in wrangler.toml`);
@@ -78,5 +84,5 @@ if (existingId && existingId !== "REPLACE_WITH_YOUR_D1_DATABASE_ID") {
 }
 
 console.log("Applying remote migrations…");
-runWrangler(["d1", "migrations", "apply", binding]);
+runWrangler(["d1", "migrations", "apply", binding, "--remote"]);
 console.log("Done.");

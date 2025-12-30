@@ -26,6 +26,17 @@ const MAX_PULL_LIMIT = 500;
 const BODY_LIMIT_BYTES = 5 * 1024 * 1024;
 const DEFAULT_MAX_PUSH_RECORDS = 500;
 
+// Cloudflare D1 has a low bound-parameter limit per SQL statement. Keep batch
+// sizes small to avoid `D1_ERROR: too many SQL variables`.
+const D1_MAX_SQL_VARS = 100;
+const D1_IN_CLAUSE_MAX_IDS = Math.max(1, D1_MAX_SQL_VARS - 2); // user_id + type
+const D1_RECORDS_UPSERT_ROWS = Math.max(1, Math.floor(D1_MAX_SQL_VARS / 14)); // records insert has 14 vars/row
+const D1_STAGED_UPSERT_ROWS = Math.max(1, Math.floor(D1_MAX_SQL_VARS / 13)); // staged_records insert has 13 vars/row
+
+const TYPE_TODO_ATTACHMENT = "todo_attachment";
+const TYPE_TODO_ATTACHMENT_CHUNK = "todo_attachment_chunk";
+const TYPE_TODO_ATTACHMENT_COMMIT = "todo_attachment_commit";
+
 type OAuthProviderConfig = {
   name: string;
   authorizeUrl: string;
@@ -1143,15 +1154,430 @@ async function putKeyBundle(request: Request, env: Env): Promise<Response> {
 
 type Hlc = { wallTimeMsUtc: number; counter: number; deviceId: string };
 
+type SyncRecordPayload = {
+  type: string;
+  recordId: string;
+  hlc: Hlc;
+  deletedAtMsUtc: number | null;
+  schemaVersion: number;
+  dekId: string;
+  payloadAlgo: string;
+  nonce: string;
+  ciphertext: string;
+};
+
 function hlcIsNewer(a: Hlc, b: Hlc): boolean {
   if (a.wallTimeMsUtc !== b.wallTimeMsUtc) return a.wallTimeMsUtc > b.wallTimeMsUtc;
   if (a.counter !== b.counter) return a.counter > b.counter;
   return a.deviceId > b.deviceId;
 }
 
+function isAttachmentStagedType(type: string): boolean {
+  return type === TYPE_TODO_ATTACHMENT || type === TYPE_TODO_ATTACHMENT_CHUNK;
+}
+
+function attachmentIdFromRecord(type: string, recordId: string): string | null {
+  if (!recordId) return null;
+  if (type === TYPE_TODO_ATTACHMENT || type === TYPE_TODO_ATTACHMENT_COMMIT) return recordId;
+  if (type === TYPE_TODO_ATTACHMENT_CHUNK) return recordId.split(":", 1)[0] ?? null;
+  return null;
+}
+
+function parseChunkIndex(recordId: string): number | null {
+  const idx = recordId.split(":").pop();
+  if (!idx) return null;
+  const n = Number.parseInt(idx, 10);
+  return Number.isFinite(n) ? n : null;
+}
+
+async function reserveServerSeqRange(
+  env: Env,
+  userId: number,
+  count: number,
+): Promise<{ firstSeq: number; lastSeq: number }> {
+  if (count <= 0) return { firstSeq: 0, lastSeq: 0 };
+
+  await d1Run(
+    env,
+    `INSERT INTO server_seq (user_id, next_seq)
+     VALUES (?, 0)
+     ON CONFLICT(user_id) DO NOTHING`,
+    userId,
+  );
+
+  const seqRow = await d1First(
+    env,
+    `UPDATE server_seq
+       SET next_seq = next_seq + ?
+     WHERE user_id = ?
+     RETURNING next_seq`,
+    count,
+    userId,
+  );
+
+  const lastSeq = Number.parseInt(String((seqRow as any)?.next_seq ?? ""), 10);
+  if (!Number.isFinite(lastSeq)) throw dbError();
+  const firstSeq = lastSeq - count + 1;
+  return { firstSeq, lastSeq };
+}
+
+async function fetchExistingHlcs(
+  env: Env,
+  table: "records" | "staged_records",
+  userId: number,
+  byType: Map<string, string[]>,
+): Promise<Map<string, Hlc>> {
+  const existing = new Map<string, Hlc>();
+  for (const [type, idsAll] of byType.entries()) {
+    const ids = Array.from(new Set(idsAll));
+    const chunkSize = D1_IN_CLAUSE_MAX_IDS;
+    for (let i = 0; i < ids.length; i += chunkSize) {
+      const chunk = ids.slice(i, i + chunkSize);
+      const placeholders = chunk.map(() => "?").join(",");
+      const sql = `SELECT record_id, hlc_wall_ms_utc, hlc_counter, hlc_device_id
+                   FROM ${table}
+                   WHERE user_id = ? AND type = ? AND record_id IN (${placeholders})`;
+      const rows = await d1All(env, sql, userId, type, ...chunk);
+      for (const row of (rows?.results ?? []) as any[]) {
+        const recordId = String(row?.record_id ?? "");
+        const wall = Number.parseInt(String(row?.hlc_wall_ms_utc ?? ""), 10);
+        const counter = Number.parseInt(String(row?.hlc_counter ?? ""), 10);
+        const deviceId = String(row?.hlc_device_id ?? "");
+        existing.set(`${type}\n${recordId}`, {
+          wallTimeMsUtc: Number.isFinite(wall) ? wall : 0,
+          counter: Number.isFinite(counter) ? counter : 0,
+          deviceId,
+        });
+      }
+    }
+  }
+  return existing;
+}
+
+async function deleteStagedAttachment(env: Env, userId: number, attachmentId: string): Promise<void> {
+  const pattern = `${attachmentId}:%`;
+  await d1Run(
+    env,
+    `DELETE FROM staged_records
+     WHERE user_id = ?
+       AND (
+         (type = ? AND record_id = ?)
+         OR (type = ? AND record_id LIKE ?)
+       )`,
+    userId,
+    TYPE_TODO_ATTACHMENT,
+    attachmentId,
+    TYPE_TODO_ATTACHMENT_CHUNK,
+    pattern,
+  );
+}
+
+async function upsertStagedRecords(
+  env: Env,
+  userId: number,
+  records: SyncRecordPayload[],
+  nowMs: number,
+): Promise<void> {
+  if (records.length === 0) return;
+
+  const chunkSize = D1_STAGED_UPSERT_ROWS;
+  for (let i = 0; i < records.length; i += chunkSize) {
+    const chunk = records.slice(i, i + chunkSize);
+    const valuesSql = chunk.map(() => "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").join(",\n");
+    const sql = `INSERT INTO staged_records (
+      user_id, type, record_id,
+      hlc_wall_ms_utc, hlc_counter, hlc_device_id,
+      deleted_at_ms_utc,
+      schema_version, dek_id,
+      algo, nonce, ciphertext,
+      updated_at_ms_utc
+    ) VALUES
+    ${valuesSql}
+    ON CONFLICT(user_id, type, record_id) DO UPDATE SET
+      hlc_wall_ms_utc = excluded.hlc_wall_ms_utc,
+      hlc_counter = excluded.hlc_counter,
+      hlc_device_id = excluded.hlc_device_id,
+      deleted_at_ms_utc = excluded.deleted_at_ms_utc,
+      schema_version = excluded.schema_version,
+      dek_id = excluded.dek_id,
+      algo = excluded.algo,
+      nonce = excluded.nonce,
+      ciphertext = excluded.ciphertext,
+      updated_at_ms_utc = excluded.updated_at_ms_utc
+    WHERE (excluded.hlc_wall_ms_utc, excluded.hlc_counter, excluded.hlc_device_id)
+        > (staged_records.hlc_wall_ms_utc, staged_records.hlc_counter, staged_records.hlc_device_id)`;
+
+    const binds: any[] = [];
+    for (const r of chunk) {
+      binds.push(
+        userId,
+        r.type,
+        r.recordId,
+        r.hlc.wallTimeMsUtc,
+        r.hlc.counter,
+        r.hlc.deviceId,
+        r.deletedAtMsUtc,
+        r.schemaVersion,
+        r.dekId,
+        r.payloadAlgo,
+        r.nonce,
+        r.ciphertext,
+        nowMs,
+      );
+    }
+
+    await d1Run(env, sql, ...binds);
+  }
+}
+
+async function commitStagedAttachment(env: Env, userId: number, attachmentId: string): Promise<void> {
+  const stagedMeta = await d1First(
+    env,
+    `SELECT
+       type,
+       record_id,
+       hlc_wall_ms_utc,
+       hlc_counter,
+       hlc_device_id,
+       deleted_at_ms_utc,
+       schema_version,
+       dek_id,
+       algo,
+       nonce,
+       ciphertext
+     FROM staged_records
+     WHERE user_id = ? AND type = ? AND record_id = ?`,
+    userId,
+    TYPE_TODO_ATTACHMENT,
+    attachmentId,
+  );
+
+  const pattern = `${attachmentId}:%`;
+  const stagedChunks = await d1All(
+    env,
+    `SELECT
+       type,
+       record_id,
+       hlc_wall_ms_utc,
+       hlc_counter,
+       hlc_device_id,
+       deleted_at_ms_utc,
+       schema_version,
+       dek_id,
+       algo,
+       nonce,
+       ciphertext
+     FROM staged_records
+     WHERE user_id = ? AND type = ? AND record_id LIKE ?`,
+    userId,
+    TYPE_TODO_ATTACHMENT_CHUNK,
+    pattern,
+  );
+
+  const rows: SyncRecordPayload[] = [];
+  if (stagedMeta) {
+    const wall = Number.parseInt(String((stagedMeta as any)?.hlc_wall_ms_utc ?? ""), 10) || 0;
+    const counter = Number.parseInt(String((stagedMeta as any)?.hlc_counter ?? ""), 10) || 0;
+    const deviceId = String((stagedMeta as any)?.hlc_device_id ?? "");
+    rows.push({
+      type: String((stagedMeta as any)?.type ?? ""),
+      recordId: String((stagedMeta as any)?.record_id ?? ""),
+      hlc: { wallTimeMsUtc: wall, counter, deviceId },
+      deletedAtMsUtc:
+        (stagedMeta as any)?.deleted_at_ms_utc === null || (stagedMeta as any)?.deleted_at_ms_utc === undefined
+          ? null
+          : Number.parseInt(String((stagedMeta as any)?.deleted_at_ms_utc ?? ""), 10) || 0,
+      schemaVersion: Number.parseInt(String((stagedMeta as any)?.schema_version ?? ""), 10) || 0,
+      dekId: String((stagedMeta as any)?.dek_id ?? ""),
+      payloadAlgo: String((stagedMeta as any)?.algo ?? ""),
+      nonce: String((stagedMeta as any)?.nonce ?? ""),
+      ciphertext: String((stagedMeta as any)?.ciphertext ?? ""),
+    });
+  }
+
+  for (const row of (stagedChunks?.results ?? []) as any[]) {
+    rows.push({
+      type: String(row?.type ?? ""),
+      recordId: String(row?.record_id ?? ""),
+      hlc: {
+        wallTimeMsUtc: Number.parseInt(String(row?.hlc_wall_ms_utc ?? ""), 10) || 0,
+        counter: Number.parseInt(String(row?.hlc_counter ?? ""), 10) || 0,
+        deviceId: String(row?.hlc_device_id ?? ""),
+      },
+      deletedAtMsUtc:
+        row?.deleted_at_ms_utc === null || row?.deleted_at_ms_utc === undefined
+          ? null
+          : Number.parseInt(String(row?.deleted_at_ms_utc ?? ""), 10) || 0,
+      schemaVersion: Number.parseInt(String(row?.schema_version ?? ""), 10) || 0,
+      dekId: String(row?.dek_id ?? ""),
+      payloadAlgo: String(row?.algo ?? ""),
+      nonce: String(row?.nonce ?? ""),
+      ciphertext: String(row?.ciphertext ?? ""),
+    });
+  }
+
+  rows.sort((a, b) => {
+    const aIsChunk = a.type === TYPE_TODO_ATTACHMENT_CHUNK;
+    const bIsChunk = b.type === TYPE_TODO_ATTACHMENT_CHUNK;
+    if (aIsChunk !== bIsChunk) return aIsChunk ? 1 : -1;
+    if (!aIsChunk) return 0;
+    const ai = parseChunkIndex(a.recordId) ?? Number.MAX_SAFE_INTEGER;
+    const bi = parseChunkIndex(b.recordId) ?? Number.MAX_SAFE_INTEGER;
+    return ai - bi;
+  });
+
+  if (rows.length === 0) return;
+
+  const byType = new Map<string, string[]>();
+  for (const r of rows) {
+    const list = byType.get(r.type);
+    if (list) list.push(r.recordId);
+    else byType.set(r.type, [r.recordId]);
+  }
+  const existing = await fetchExistingHlcs(env, "records", userId, byType);
+
+  const toApply: SyncRecordPayload[] = [];
+  for (const r of rows) {
+    const cur = existing.get(`${r.type}\n${r.recordId}`) ?? null;
+    if (!cur || hlcIsNewer(r.hlc, cur)) toApply.push(r);
+  }
+
+  const nowMs = nowMsUtc();
+  if (toApply.length > 0) {
+    const { firstSeq } = await reserveServerSeqRange(env, userId, toApply.length);
+
+    const appliedChunkSize = D1_RECORDS_UPSERT_ROWS;
+    for (let i = 0; i < toApply.length; i += appliedChunkSize) {
+      const chunk = toApply.slice(i, i + appliedChunkSize);
+      const valuesSql = chunk.map(() => "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").join(",\n");
+      const sql = `INSERT INTO records (
+        user_id, type, record_id,
+        hlc_wall_ms_utc, hlc_counter, hlc_device_id,
+        deleted_at_ms_utc,
+        schema_version, dek_id,
+        algo, nonce, ciphertext,
+        server_seq, updated_at_ms_utc
+      ) VALUES
+      ${valuesSql}
+      ON CONFLICT(user_id, type, record_id) DO UPDATE SET
+        hlc_wall_ms_utc = excluded.hlc_wall_ms_utc,
+        hlc_counter = excluded.hlc_counter,
+        hlc_device_id = excluded.hlc_device_id,
+        deleted_at_ms_utc = excluded.deleted_at_ms_utc,
+        schema_version = excluded.schema_version,
+        dek_id = excluded.dek_id,
+        algo = excluded.algo,
+        nonce = excluded.nonce,
+        ciphertext = excluded.ciphertext,
+        server_seq = excluded.server_seq,
+        updated_at_ms_utc = excluded.updated_at_ms_utc
+      WHERE (excluded.hlc_wall_ms_utc, excluded.hlc_counter, excluded.hlc_device_id)
+          > (records.hlc_wall_ms_utc, records.hlc_counter, records.hlc_device_id)`;
+
+      const binds: any[] = [];
+      for (let j = 0; j < chunk.length; j++) {
+        const r = chunk[j]!;
+        const serverSeq = firstSeq + i + j;
+        binds.push(
+          userId,
+          r.type,
+          r.recordId,
+          r.hlc.wallTimeMsUtc,
+          r.hlc.counter,
+          r.hlc.deviceId,
+          r.deletedAtMsUtc,
+          r.schemaVersion,
+          r.dekId,
+          r.payloadAlgo,
+          r.nonce,
+          r.ciphertext,
+          serverSeq,
+          nowMs,
+        );
+      }
+
+      await d1Run(env, sql, ...binds);
+    }
+  }
+
+  await deleteStagedAttachment(env, userId, attachmentId);
+}
+
+async function compactCommittedAttachmentChunks(
+  env: Env,
+  userId: number,
+  attachmentId: string,
+  deletedAtMsUtc: number,
+): Promise<void> {
+  const nowMs = nowMsUtc();
+  const pattern = `${attachmentId}:%`;
+
+  const rows = await d1All(
+    env,
+    `SELECT
+       record_id,
+       hlc_wall_ms_utc,
+       deleted_at_ms_utc,
+       LENGTH(nonce) AS nonce_len,
+       LENGTH(ciphertext) AS ciphertext_len
+     FROM records
+     WHERE user_id = ? AND type = ? AND record_id LIKE ?`,
+    userId,
+    TYPE_TODO_ATTACHMENT_CHUNK,
+    pattern,
+  );
+
+  const results = (rows?.results ?? []) as any[];
+  const toCompact: { recordId: string; existingWall: number }[] = [];
+  for (const row of results) {
+    const recordId = String(row?.record_id ?? "");
+    const existingWall = Number.parseInt(String(row?.hlc_wall_ms_utc ?? ""), 10) || 0;
+    const existingDeleted =
+      row?.deleted_at_ms_utc === null || row?.deleted_at_ms_utc === undefined
+        ? null
+        : Number.parseInt(String(row?.deleted_at_ms_utc ?? ""), 10) || 0;
+    const nonceLen = Number.parseInt(String(row?.nonce_len ?? ""), 10) || 0;
+    const ciphertextLen = Number.parseInt(String(row?.ciphertext_len ?? ""), 10) || 0;
+
+    if (existingDeleted && nonceLen === 0 && ciphertextLen === 0) continue;
+    toCompact.push({ recordId, existingWall });
+  }
+
+  if (toCompact.length === 0) return;
+
+  const { firstSeq } = await reserveServerSeqRange(env, userId, toCompact.length);
+  for (let i = 0; i < toCompact.length; i++) {
+    const row = toCompact[i]!;
+    const serverSeq = firstSeq + i;
+    const newWall = Math.max(row.existingWall, nowMs) + 1;
+    await d1Run(
+      env,
+      `UPDATE records
+       SET hlc_wall_ms_utc = ?,
+           hlc_counter = 0,
+           hlc_device_id = 'server',
+           deleted_at_ms_utc = ?,
+           nonce = '',
+           ciphertext = '',
+           server_seq = ?,
+           updated_at_ms_utc = ?
+       WHERE user_id = ? AND type = ? AND record_id = ?`,
+      newWall,
+      deletedAtMsUtc,
+      serverSeq,
+      nowMs,
+      userId,
+      TYPE_TODO_ATTACHMENT_CHUNK,
+      row.recordId,
+    );
+  }
+}
+
 async function pushSync(request: Request, env: Env): Promise<Response> {
   const appCfg = loadConfig(request, env);
   const user = await authenticateApiRequest(env, appCfg.auth, request);
+
+  const nowMs = nowMsUtc();
 
   const body = (await readJsonBody(request, BODY_LIMIT_BYTES)) as any;
   const recordsIn = body?.records;
@@ -1160,20 +1586,22 @@ async function pushSync(request: Request, env: Env): Promise<Response> {
   if (recordsIn.length > appCfg.maxPushRecords) return jsonError(400, "too many records");
 
   type Rec = {
-    type: string;
-    recordId: string;
-    hlc: Hlc;
-    deletedAtMsUtc: number | null;
-    schemaVersion: number;
-    dekId: string;
-    payloadAlgo: string;
-    nonce: string;
-    ciphertext: string;
+    type: SyncRecordPayload["type"];
+    recordId: SyncRecordPayload["recordId"];
+    hlc: SyncRecordPayload["hlc"];
+    deletedAtMsUtc: SyncRecordPayload["deletedAtMsUtc"];
+    schemaVersion: SyncRecordPayload["schemaVersion"];
+    dekId: SyncRecordPayload["dekId"];
+    payloadAlgo: SyncRecordPayload["payloadAlgo"];
+    nonce: SyncRecordPayload["nonce"];
+    ciphertext: SyncRecordPayload["ciphertext"];
     tooLarge: boolean;
   };
 
   const parsed: Rec[] = [];
-  const byType = new Map<string, string[]>();
+  const byTypeCommitted = new Map<string, string[]>();
+  const byTypeStaged = new Map<string, string[]>();
+  const attachmentIdsToCheckDeleted = new Set<string>();
 
   for (const r of recordsIn as any[]) {
     const type = String(r?.type ?? "");
@@ -1212,164 +1640,300 @@ async function pushSync(request: Request, env: Env): Promise<Response> {
     };
     parsed.push(rec);
 
-    if (!tooLarge) {
-      const key = type;
-      const list = byType.get(key);
+    if (!tooLarge && type !== TYPE_TODO_ATTACHMENT_COMMIT) {
+      const list = byTypeCommitted.get(type);
       if (list) list.push(recordId);
-      else byType.set(key, [recordId]);
+      else byTypeCommitted.set(type, [recordId]);
+
+      if (isAttachmentStagedType(type)) {
+        const stagedList = byTypeStaged.get(type);
+        if (stagedList) stagedList.push(recordId);
+        else byTypeStaged.set(type, [recordId]);
+      }
+    }
+
+    const attachmentId = attachmentIdFromRecord(type, recordId);
+    if (attachmentId && isAttachmentStagedType(type) && rec.deletedAtMsUtc === null) {
+      attachmentIdsToCheckDeleted.add(attachmentId);
+    }
+    if (attachmentId && type === TYPE_TODO_ATTACHMENT_COMMIT && rec.deletedAtMsUtc === null) {
+      attachmentIdsToCheckDeleted.add(attachmentId);
+    }
+  }
+
+  const attachmentDeleted = new Map<string, number>();
+  const attachments = Array.from(attachmentIdsToCheckDeleted);
+  const deletedChunkSize = D1_IN_CLAUSE_MAX_IDS;
+  for (let i = 0; i < attachments.length; i += deletedChunkSize) {
+    const chunk = attachments.slice(i, i + deletedChunkSize);
+    const placeholders = chunk.map(() => "?").join(",");
+    const sql = `SELECT record_id, deleted_at_ms_utc
+                 FROM records
+                 WHERE user_id = ? AND type = ? AND record_id IN (${placeholders})`;
+    const rows = await d1All(env, sql, user.userId, TYPE_TODO_ATTACHMENT, ...chunk);
+    for (const row of (rows?.results ?? []) as any[]) {
+      const recordId = String(row?.record_id ?? "");
+      const deletedAt =
+        row?.deleted_at_ms_utc === null || row?.deleted_at_ms_utc === undefined
+          ? null
+          : Number.parseInt(String(row?.deleted_at_ms_utc ?? ""), 10) || 0;
+      if (deletedAt && deletedAt > 0) attachmentDeleted.set(recordId, deletedAt);
     }
   }
 
   // Fetch existing HLCs in batches to reduce query count.
-  const existing = new Map<string, Hlc>();
-  for (const [type, idsAll] of byType.entries()) {
-    const ids = Array.from(new Set(idsAll));
-    const chunkSize = 200;
-    for (let i = 0; i < ids.length; i += chunkSize) {
-      const chunk = ids.slice(i, i + chunkSize);
-      const placeholders = chunk.map(() => "?").join(",");
-      const sql = `SELECT record_id, hlc_wall_ms_utc, hlc_counter, hlc_device_id
-	                   FROM records
-	                   WHERE user_id = ? AND type = ? AND record_id IN (${placeholders})`;
-      const rows = await d1All(env, sql, user.userId, type, ...chunk);
-      for (const row of (rows?.results ?? []) as any[]) {
-        const recordId = String(row?.record_id ?? "");
-        const wall = Number.parseInt(String(row?.hlc_wall_ms_utc ?? ""), 10);
-        const counter = Number.parseInt(String(row?.hlc_counter ?? ""), 10);
-        const deviceId = String(row?.hlc_device_id ?? "");
-        existing.set(`${type}\n${recordId}`, {
-          wallTimeMsUtc: Number.isFinite(wall) ? wall : 0,
-          counter: Number.isFinite(counter) ? counter : 0,
-          deviceId,
-        });
-      }
-    }
-  }
+  const existingCommitted = await fetchExistingHlcs(env, "records", user.userId, byTypeCommitted);
+  const existingStaged = await fetchExistingHlcs(env, "staged_records", user.userId, byTypeStaged);
 
-  const acceptedInput: Rec[] = [];
-  const acceptedMeta: { type: string; recordId: string; serverSeq: number }[] = [];
+  const accepted: { type: string; recordId: string; serverSeq: number }[] = [];
   const rejected: { type: string; recordId: string; reason: string }[] = [];
+
+  const commitRequests: { attachmentId: string; deletedAtMsUtc: number | null }[] = [];
+  const deletedAttachmentsInPush = new Set<string>();
+  const stagedUpserts = new Map<string, SyncRecordPayload>();
+  const acceptedInput: Rec[] = [];
 
   for (const r of parsed) {
     if (r.tooLarge) {
       rejected.push({ type: r.type, recordId: r.recordId, reason: "record_too_large" });
       continue;
     }
-    const cur = existing.get(`${r.type}\n${r.recordId}`) ?? null;
+
+    if (r.type === TYPE_TODO_ATTACHMENT_COMMIT) {
+      commitRequests.push({ attachmentId: r.recordId, deletedAtMsUtc: r.deletedAtMsUtc });
+      continue;
+    }
+
+    const isStagedType = isAttachmentStagedType(r.type);
+    if (isStagedType && r.deletedAtMsUtc === null) {
+      const attachmentId = attachmentIdFromRecord(r.type, r.recordId);
+      if (attachmentId && (attachmentDeleted.has(attachmentId) || deletedAttachmentsInPush.has(attachmentId))) {
+        rejected.push({ type: r.type, recordId: r.recordId, reason: "attachment_deleted" });
+        continue;
+      }
+    }
+
+    const key = `${r.type}\n${r.recordId}`;
+    const committedHlc = existingCommitted.get(key) ?? null;
+    const stagedHlc = !committedHlc && isStagedType ? existingStaged.get(key) ?? null : null;
+    const cur = committedHlc ?? stagedHlc;
+
     if (cur && !hlcIsNewer(r.hlc, cur)) {
       rejected.push({ type: r.type, recordId: r.recordId, reason: "older_hlc" });
       continue;
     }
+
+    // If the attachment metadata is tombstoned in `records` within this request,
+    // subsequent meta/chunk uploads must be rejected to avoid recreating staged data.
+    if (r.type === TYPE_TODO_ATTACHMENT && r.deletedAtMsUtc !== null && committedHlc) {
+      const attachmentId = r.recordId;
+      if (attachmentId) deletedAttachmentsInPush.add(attachmentId);
+    }
+
+    if (isStagedType && !committedHlc) {
+      // For attachments/chunks, a tombstone before commit should simply remove any staged data and
+      // remain invisible to other devices.
+      if (r.deletedAtMsUtc !== null) {
+        if (r.type === TYPE_TODO_ATTACHMENT) {
+          const attachmentId = r.recordId;
+          if (attachmentId) {
+            await deleteStagedAttachment(env, user.userId, attachmentId);
+            const prefixChunk = `${TYPE_TODO_ATTACHMENT_CHUNK}\n${attachmentId}:`;
+            const toDelete: string[] = [];
+            for (const k of stagedUpserts.keys()) {
+              if (k === `${TYPE_TODO_ATTACHMENT}\n${attachmentId}` || k.startsWith(prefixChunk)) {
+                toDelete.push(k);
+              }
+            }
+            for (const k of toDelete) stagedUpserts.delete(k);
+          }
+          accepted.push({ type: r.type, recordId: r.recordId, serverSeq: 0 });
+          continue;
+        }
+
+        if (r.type === TYPE_TODO_ATTACHMENT_CHUNK) {
+          await d1Run(
+            env,
+            `DELETE FROM staged_records WHERE user_id = ? AND type = ? AND record_id = ?`,
+            user.userId,
+            r.type,
+            r.recordId,
+          );
+          stagedUpserts.delete(key);
+          accepted.push({ type: r.type, recordId: r.recordId, serverSeq: 0 });
+          continue;
+        }
+      }
+
+      stagedUpserts.set(key, {
+        type: r.type,
+        recordId: r.recordId,
+        hlc: r.hlc,
+        deletedAtMsUtc: r.deletedAtMsUtc,
+        schemaVersion: r.schemaVersion,
+        dekId: r.dekId,
+        payloadAlgo: r.payloadAlgo,
+        nonce: r.nonce,
+        ciphertext: r.ciphertext,
+      });
+
+      accepted.push({ type: r.type, recordId: r.recordId, serverSeq: 0 });
+      continue;
+    }
+
     acceptedInput.push(r);
   }
 
-  if (acceptedInput.length === 0) {
-    return jsonResponse({ accepted: [], rejected });
-  }
+  await upsertStagedRecords(env, user.userId, Array.from(stagedUpserts.values()), nowMs);
 
-  // Reserve server_seq range.
-  await d1Run(
-    env,
-    `INSERT INTO server_seq (user_id, next_seq)
-     VALUES (?, 0)
-     ON CONFLICT(user_id) DO NOTHING`,
-    user.userId,
-  );
+  if (acceptedInput.length > 0) {
+    const { firstSeq } = await reserveServerSeqRange(env, user.userId, acceptedInput.length);
 
-  const seqRow = await d1First(
-    env,
-    `UPDATE server_seq
-       SET next_seq = next_seq + ?
-     WHERE user_id = ?
-     RETURNING next_seq`,
-    acceptedInput.length,
-    user.userId,
-  );
-
-  const newNext = Number.parseInt(String((seqRow as any)?.next_seq ?? ""), 10);
-  if (!Number.isFinite(newNext)) return dbError();
-  const oldNext = newNext - acceptedInput.length;
-
-  const nowMs = nowMsUtc();
-  for (let i = 0; i < acceptedInput.length; i++) {
-    const serverSeq = oldNext + i + 1;
-    acceptedMeta.push({
-      type: acceptedInput[i]!.type,
-      recordId: acceptedInput[i]!.recordId,
-      serverSeq,
-    });
-  }
-
-  // Upsert in chunks with RETURNING to detect concurrent HLC races.
-  const applied = new Set<string>();
-  const chunkSize = 50;
-  for (let i = 0; i < acceptedInput.length; i += chunkSize) {
-    const chunk = acceptedInput.slice(i, i + chunkSize);
-    const chunkMeta = acceptedMeta.slice(i, i + chunkSize);
-
-    const valuesSql = chunk.map(() => "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").join(",\n");
-    const sql = `INSERT INTO records (
-      user_id, type, record_id,
-      hlc_wall_ms_utc, hlc_counter, hlc_device_id,
-      deleted_at_ms_utc,
-      schema_version, dek_id,
-      algo, nonce, ciphertext,
-      server_seq, updated_at_ms_utc
-    ) VALUES
-    ${valuesSql}
-    ON CONFLICT(user_id, type, record_id) DO UPDATE SET
-      hlc_wall_ms_utc = excluded.hlc_wall_ms_utc,
-      hlc_counter = excluded.hlc_counter,
-      hlc_device_id = excluded.hlc_device_id,
-      deleted_at_ms_utc = excluded.deleted_at_ms_utc,
-      schema_version = excluded.schema_version,
-      dek_id = excluded.dek_id,
-      algo = excluded.algo,
-      nonce = excluded.nonce,
-      ciphertext = excluded.ciphertext,
-      server_seq = excluded.server_seq,
-      updated_at_ms_utc = excluded.updated_at_ms_utc
-    WHERE (excluded.hlc_wall_ms_utc, excluded.hlc_counter, excluded.hlc_device_id)
-        > (records.hlc_wall_ms_utc, records.hlc_counter, records.hlc_device_id)
-    RETURNING type, record_id`;
-
-    const binds: any[] = [];
-    for (let j = 0; j < chunk.length; j++) {
-      const r = chunk[j]!;
-      const m = chunkMeta[j]!;
-      binds.push(
-        user.userId,
-        r.type,
-        r.recordId,
-        r.hlc.wallTimeMsUtc,
-        r.hlc.counter,
-        r.hlc.deviceId,
-        r.deletedAtMsUtc,
-        r.schemaVersion,
-        r.dekId,
-        r.payloadAlgo,
-        r.nonce,
-        r.ciphertext,
-        m.serverSeq,
-        nowMs,
-      );
+    const acceptedMeta: { type: string; recordId: string; serverSeq: number; deletedAtMsUtc: number | null }[] = [];
+    for (let i = 0; i < acceptedInput.length; i++) {
+      const serverSeq = firstSeq + i;
+      acceptedMeta.push({
+        type: acceptedInput[i]!.type,
+        recordId: acceptedInput[i]!.recordId,
+        serverSeq,
+        deletedAtMsUtc: acceptedInput[i]!.deletedAtMsUtc,
+      });
     }
 
-    const res = await d1All(env, sql, ...binds);
-    for (const row of (res?.results ?? []) as any[]) {
-      const type = String(row?.type ?? "");
-      const recordId = String(row?.record_id ?? "");
-      applied.add(`${type}\n${recordId}`);
+    // Upsert in chunks with RETURNING to detect concurrent HLC races.
+    const applied = new Set<string>();
+    const chunkSize = D1_RECORDS_UPSERT_ROWS;
+    for (let i = 0; i < acceptedInput.length; i += chunkSize) {
+      const chunk = acceptedInput.slice(i, i + chunkSize);
+      const chunkMeta = acceptedMeta.slice(i, i + chunkSize);
+
+      const valuesSql = chunk.map(() => "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").join(",\n");
+      const sql = `INSERT INTO records (
+        user_id, type, record_id,
+        hlc_wall_ms_utc, hlc_counter, hlc_device_id,
+        deleted_at_ms_utc,
+        schema_version, dek_id,
+        algo, nonce, ciphertext,
+        server_seq, updated_at_ms_utc
+      ) VALUES
+      ${valuesSql}
+      ON CONFLICT(user_id, type, record_id) DO UPDATE SET
+        hlc_wall_ms_utc = excluded.hlc_wall_ms_utc,
+        hlc_counter = excluded.hlc_counter,
+        hlc_device_id = excluded.hlc_device_id,
+        deleted_at_ms_utc = excluded.deleted_at_ms_utc,
+        schema_version = excluded.schema_version,
+        dek_id = excluded.dek_id,
+        algo = excluded.algo,
+        nonce = excluded.nonce,
+        ciphertext = excluded.ciphertext,
+        server_seq = excluded.server_seq,
+        updated_at_ms_utc = excluded.updated_at_ms_utc
+      WHERE (excluded.hlc_wall_ms_utc, excluded.hlc_counter, excluded.hlc_device_id)
+          > (records.hlc_wall_ms_utc, records.hlc_counter, records.hlc_device_id)
+      RETURNING type, record_id`;
+
+      const binds: any[] = [];
+      for (let j = 0; j < chunk.length; j++) {
+        const r = chunk[j]!;
+        const m = chunkMeta[j]!;
+        binds.push(
+          user.userId,
+          r.type,
+          r.recordId,
+          r.hlc.wallTimeMsUtc,
+          r.hlc.counter,
+          r.hlc.deviceId,
+          r.deletedAtMsUtc,
+          r.schemaVersion,
+          r.dekId,
+          r.payloadAlgo,
+          r.nonce,
+          r.ciphertext,
+          m.serverSeq,
+          nowMs,
+        );
+      }
+
+      const res = await d1All(env, sql, ...binds);
+      for (const row of (res?.results ?? []) as any[]) {
+        const type = String(row?.type ?? "");
+        const recordId = String(row?.record_id ?? "");
+        applied.add(`${type}\n${recordId}`);
+      }
+    }
+
+    for (const m of acceptedMeta) {
+      const key = `${m.type}\n${m.recordId}`;
+      if (applied.has(key)) {
+        accepted.push({ type: m.type, recordId: m.recordId, serverSeq: m.serverSeq });
+
+        if (m.type === TYPE_TODO_ATTACHMENT && m.deletedAtMsUtc !== null) {
+          attachmentDeleted.set(m.recordId, m.deletedAtMsUtc);
+          await deleteStagedAttachment(env, user.userId, m.recordId);
+          await compactCommittedAttachmentChunks(env, user.userId, m.recordId, m.deletedAtMsUtc ?? nowMs);
+        }
+      } else {
+        rejected.push({ type: m.type, recordId: m.recordId, reason: "older_hlc" });
+      }
     }
   }
 
-  const accepted: { type: string; recordId: string; serverSeq: number }[] = [];
-  for (const m of acceptedMeta) {
-    if (applied.has(`${m.type}\n${m.recordId}`)) {
-      accepted.push({ type: m.type, recordId: m.recordId, serverSeq: m.serverSeq });
-    } else {
-      rejected.push({ type: m.type, recordId: m.recordId, reason: "older_hlc" });
+  for (const c of commitRequests) {
+    const attachmentId = c.attachmentId;
+    if (c.deletedAtMsUtc !== null) {
+      accepted.push({ type: TYPE_TODO_ATTACHMENT_COMMIT, recordId: attachmentId, serverSeq: 0 });
+      continue;
     }
+
+    const deletedRow = await d1First(
+      env,
+      `SELECT deleted_at_ms_utc
+       FROM records
+       WHERE user_id = ? AND type = ? AND record_id = ?`,
+      user.userId,
+      TYPE_TODO_ATTACHMENT,
+      attachmentId,
+    );
+    const committedDeleted =
+      (deletedRow as any)?.deleted_at_ms_utc === null || (deletedRow as any)?.deleted_at_ms_utc === undefined
+        ? null
+        : Number.parseInt(String((deletedRow as any)?.deleted_at_ms_utc ?? ""), 10) || 0;
+    if (committedDeleted && committedDeleted > 0) {
+      rejected.push({ type: TYPE_TODO_ATTACHMENT_COMMIT, recordId: attachmentId, reason: "attachment_deleted" });
+      continue;
+    }
+
+    const hasCommittedMeta = await d1First(
+      env,
+      `SELECT 1 AS ok
+       FROM records
+       WHERE user_id = ? AND type = ? AND record_id = ? AND deleted_at_ms_utc IS NULL
+       LIMIT 1`,
+      user.userId,
+      TYPE_TODO_ATTACHMENT,
+      attachmentId,
+    );
+
+    const hasStagedMeta = await d1First(
+      env,
+      `SELECT 1 AS ok FROM staged_records WHERE user_id = ? AND type = ? AND record_id = ? LIMIT 1`,
+      user.userId,
+      TYPE_TODO_ATTACHMENT,
+      attachmentId,
+    );
+
+    if (!hasCommittedMeta && !hasStagedMeta) {
+      rejected.push({
+        type: TYPE_TODO_ATTACHMENT_COMMIT,
+        recordId: attachmentId,
+        reason: "missing_attachment_meta",
+      });
+      continue;
+    }
+
+    await commitStagedAttachment(env, user.userId, attachmentId);
+    accepted.push({ type: TYPE_TODO_ATTACHMENT_COMMIT, recordId: attachmentId, serverSeq: 0 });
   }
 
   return jsonResponse({ accepted, rejected });
@@ -1383,6 +1947,7 @@ async function pullSync(request: Request, env: Env): Promise<Response> {
   const since = Math.max(0, Number.parseInt(url.searchParams.get("since") ?? "0", 10) || 0);
   const limitRaw = Number.parseInt(url.searchParams.get("limit") ?? "200", 10) || 200;
   const limit = Math.min(MAX_PULL_LIMIT, Math.max(1, limitRaw));
+  const excludeDeviceId = (url.searchParams.get("excludeDeviceId") ?? "").trim() || null;
 
   const rows = await d1All(
     env,
@@ -1400,11 +1965,13 @@ async function pullSync(request: Request, env: Env): Promise<Response> {
        ciphertext,
        server_seq
      FROM records
-     WHERE user_id = ? AND server_seq > ?
+     WHERE user_id = ? AND server_seq > ? AND (? IS NULL OR hlc_device_id != ?)
      ORDER BY server_seq ASC
      LIMIT ?`,
     user.userId,
     since,
+    excludeDeviceId,
+    excludeDeviceId,
     limit,
   );
 

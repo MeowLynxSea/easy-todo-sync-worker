@@ -88,4 +88,14 @@
 - `GET /v1/key-bundle`（`Authorization: Bearer <accessToken>`）
 - `PUT /v1/key-bundle`（`Authorization: Bearer <accessToken>`）
 - `POST /v1/sync/push`（`Authorization: Bearer <accessToken>`）
-- `GET /v1/sync/pull?since=<serverSeq>&limit=<n>`（`Authorization: Bearer <accessToken>`）
+- `GET /v1/sync/pull?since=<serverSeq>&limit=<n>&excludeDeviceId=<deviceId>`（`Authorization: Bearer <accessToken>`）
+
+## 附件同步（Attachment）
+
+Cloudflare Workers 版本已对齐 Rust `sync_server` 的附件分段上传/提交语义：
+
+- `todo_attachment`：附件元信息记录（`recordId = <attachmentId>`）
+- `todo_attachment_chunk`：附件分块记录（`recordId = <attachmentId>:<chunkIndex>`）
+- `todo_attachment_commit`：提交标记（`recordId = <attachmentId>`）
+
+服务端会先把 `todo_attachment`/`todo_attachment_chunk` 写入 `staged_records`，在收到对应的 `todo_attachment_commit` 之后再一次性提交到 `records`，从而让其它设备只会通过 `/v1/sync/pull` 看到“已提交完成”的附件数据。
